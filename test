@@ -1,0 +1,142 @@
+DELIMITER $$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `proses_closing`(IN `v_bulan` INT, IN `v_tahun` INT, IN `v_posted_by` INT)
+BEGIN
+    DECLARE done INT DEFAULT 0;
+    DECLARE v_id_akun INT;
+    DECLARE v_nama_akun VARCHAR(100);
+    DECLARE v_jenis VARCHAR(20);
+    DECLARE v_total_debit DECIMAL(15,2);
+    DECLARE v_total_kredit DECIMAL(15,2);
+    DECLARE v_saldo DECIMAL(15,2);
+    DECLARE v_laba_rugi DECIMAL(15,2) DEFAULT 0;
+    DECLARE v_modal_awal DECIMAL(15,2) DEFAULT 0;
+    DECLARE v_modal_tambahan DECIMAL(15,2) DEFAULT 0;
+    DECLARE v_modal_akhir DECIMAL(15,2) DEFAULT 0;
+    DECLARE v_prive_total DECIMAL(15,2) DEFAULT 0;
+    DECLARE v_total_pendapatan DECIMAL(15,2) DEFAULT 0;
+    DECLARE v_total_beban DECIMAL(15,2) DEFAULT 0;
+
+    DECLARE akun_cursor CURSOR FOR
+        SELECT id_akun, nama_akun,
+               CASE 
+                   WHEN SUBSTRING(CAST(id_akun AS CHAR), 1, 1) = '4' THEN 'pendapatan'
+                   WHEN SUBSTRING(CAST(id_akun AS CHAR), 1, 1) = '5' THEN 'beban'
+                   WHEN id_akun = 302 THEN 'prive'
+                   ELSE 'lainnya'
+               END as jenis
+        FROM akun
+        WHERE SUBSTRING(CAST(id_akun AS CHAR), 1, 1) IN ('4', '5') OR id_akun = 302;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    IF EXISTS (SELECT 1 FROM closing WHERE bulan = v_bulan AND tahun = v_tahun LIMIT 1) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Periode sudah ditutup sebelumnya.';
+    END IF;
+
+    IF v_bulan = 1 AND v_tahun = YEAR(CURDATE()) THEN
+        SELECT IFNULL(SUM(CASE WHEN dt.debit_kredit = 'K' THEN dt.nilai ELSE 0 END), 0)
+        INTO v_modal_awal
+        FROM detail_transaksi dt 
+        JOIN transaksi t ON dt.id_transaksi = t.id_transaksi
+        WHERE dt.id_akun = 311
+          AND MONTH(t.tgl_transaksi) = v_bulan
+          AND YEAR(t.tgl_transaksi) = v_tahun
+          AND t.post = '1'
+          AND t.nama_transaksi LIKE '%Modal Awal%';
+
+        IF v_modal_awal = 0 THEN
+            SELECT SUM(CASE WHEN dt.debit_kredit = 'K' THEN dt.nilai ELSE -dt.nilai END)
+            INTO v_modal_awal
+            FROM detail_transaksi dt
+            JOIN transaksi t ON dt.id_transaksi = t.id_transaksi
+            WHERE dt.id_akun = 311
+              AND (YEAR(t.tgl_transaksi) < v_tahun OR 
+                   (YEAR(t.tgl_transaksi) = v_tahun AND MONTH(t.tgl_transaksi) < v_bulan))
+              AND t.post = '1';
+
+            IF v_modal_awal IS NULL THEN
+                SET v_modal_awal = 150000000;
+            END IF;
+        END IF;
+
+        INSERT INTO closing (id_akun, jenis_penyesuaian, bulan, tahun, debit, kredit, keterangan, tanggal_closing, posted_by)
+        VALUES (311, 'modal_awal', v_bulan, v_tahun, 0, v_modal_awal, 'Modal awal periode', CURDATE(), v_posted_by);
+    ELSE
+        SELECT kredit INTO v_modal_awal
+        FROM closing
+        WHERE id_akun = 311 AND jenis_penyesuaian = 'modal_akhir'
+          AND ((bulan = v_bulan-1 AND tahun = v_tahun) OR (bulan = 12 AND tahun = v_tahun-1))
+        ORDER BY tahun DESC, bulan DESC LIMIT 1;
+    END IF;
+
+    SELECT IFNULL(SUM(CASE WHEN dt.debit_kredit = 'K' THEN dt.nilai ELSE 0 END), 0)
+    INTO v_modal_tambahan
+    FROM detail_transaksi dt 
+    JOIN transaksi t ON dt.id_transaksi = t.id_transaksi
+    WHERE dt.id_akun = 311
+      AND MONTH(t.tgl_transaksi) = v_bulan
+      AND YEAR(t.tgl_transaksi) = v_tahun
+      AND t.post = '1'
+      AND t.nama_transaksi LIKE '%Modal Tambahan%';
+
+    IF v_modal_tambahan > 0 THEN
+        INSERT INTO closing (id_akun, jenis_penyesuaian, bulan, tahun, debit, kredit, keterangan, tanggal_closing, posted_by)
+        VALUES (311, 'modal_tambahan', v_bulan, v_tahun, 0, v_modal_tambahan, 'Modal tambahan periode', CURDATE(), v_posted_by);
+    END IF;
+
+    OPEN akun_cursor;
+    akun_loop: LOOP
+        FETCH akun_cursor INTO v_id_akun, v_nama_akun, v_jenis;
+        IF done THEN LEAVE akun_loop; END IF;
+
+        SELECT 
+            IFNULL(SUM(CASE WHEN dt.debit_kredit = 'D' THEN dt.nilai ELSE 0 END), 0),
+            IFNULL(SUM(CASE WHEN dt.debit_kredit = 'K' THEN dt.nilai ELSE 0 END), 0)
+        INTO v_total_debit, v_total_kredit
+        FROM detail_transaksi dt 
+        JOIN transaksi t ON dt.id_transaksi = t.id_transaksi
+        WHERE dt.id_akun = v_id_akun
+          AND MONTH(t.tgl_transaksi) = v_bulan
+          AND YEAR(t.tgl_transaksi) = v_tahun
+          AND t.hapus = '0';
+
+        IF v_jenis = 'pendapatan' THEN
+            SET v_saldo = v_total_kredit - v_total_debit;
+            SET v_total_pendapatan = v_total_pendapatan + v_saldo;
+
+            IF v_saldo > 0 THEN
+                INSERT INTO closing VALUES
+                (NULL, v_bulan, v_tahun, v_id_akun, 'laba_rugi', v_saldo, 0, NULL, CONCAT('Tutup pendapatan - ', v_nama_akun), CURDATE(), v_posted_by),
+                (NULL, v_bulan, v_tahun, 311, 'laba_rugi', 0, v_saldo, NULL, CONCAT('Tambah modal dari pendapatan - ', v_nama_akun), CURDATE(), v_posted_by);
+            END IF;
+
+        ELSEIF v_jenis = 'beban' THEN
+            SET v_saldo = v_total_debit - v_total_kredit;
+            SET v_total_beban = v_total_beban + v_saldo;
+
+            IF v_saldo > 0 THEN
+                INSERT INTO closing VALUES
+                (NULL, v_bulan, v_tahun, v_id_akun, 'laba_rugi', 0, v_saldo, NULL, CONCAT('Tutup beban - ', v_nama_akun), CURDATE(), v_posted_by),
+                (NULL, v_bulan, v_tahun, 311, 'laba_rugi', v_saldo, 0, NULL, CONCAT('Kurangi modal dari beban - ', v_nama_akun), CURDATE(), v_posted_by);
+            END IF;
+
+        ELSEIF v_jenis = 'prive' THEN
+            SET v_saldo = v_total_debit - v_total_kredit;
+            SET v_prive_total = v_prive_total + v_saldo;
+
+            IF v_saldo > 0 THEN
+                INSERT INTO closing VALUES
+                (NULL, v_bulan, v_tahun, v_id_akun, 'prive', 0, v_saldo, NULL, CONCAT('Tutup prive - ', v_nama_akun), CURDATE(), v_posted_by),
+                (NULL, v_bulan, v_tahun, 311, 'prive', v_saldo, 0, NULL, CONCAT('Kurangi modal karena prive - ', v_nama_akun), CURDATE(), v_posted_by);
+            END IF;
+        END IF;
+    END LOOP;
+    CLOSE akun_cursor;
+
+    SET v_laba_rugi = v_total_pendapatan - v_total_beban;
+    SET v_modal_akhir = v_modal_awal + v_modal_tambahan + v_laba_rugi - v_prive_total;
+
+    INSERT INTO closing (id_akun, jenis_penyesuaian, bulan, tahun, debit, kredit, keterangan, tanggal_closing, posted_by)
+    VALUES (311, 'modal_akhir', v_bulan, v_tahun, 0, v_modal_akhir, 'Modal akhir periode', CURDATE(), v_posted_by);
+END$$
+DELIMITER ;
